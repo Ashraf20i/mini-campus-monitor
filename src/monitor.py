@@ -1,7 +1,7 @@
 """
 Module de supervision réseau.
 Contient les fonctions de ping, la boucle de supervision, et l'intégration
-avec le détecteur d'anomalies.
+avec le détecteur d'anomalies et la persistance SQLite.
 """
 
 import subprocess
@@ -19,6 +19,7 @@ from src.config import (
     ALERTS_FILE,
 )
 from src.detector import AnomalyDetector
+from src import storage   # ← nouvel import
 
 # Chemin racine du projet (calculé dynamiquement)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,8 +47,8 @@ def ping_with_latency(ip: str, timeout: int = PING_TIMEOUT) -> tuple[bool, float
     return is_alive, latency
 
 
-def log_metric(timestamp: str, host: str, ip: str, status: str, latency_ms: float | None) -> None:
-    """Écrit une ligne de mesure dans le fichier CSV des métriques."""
+def log_metric_csv(timestamp: str, host: str, ip: str, status: str, latency_ms: float | None) -> None:
+    """Écrit une ligne de mesure dans le fichier CSV (lecture humaine)."""
     file_path = PROJECT_ROOT / METRICS_FILE
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = file_path.exists()
@@ -60,8 +61,8 @@ def log_metric(timestamp: str, host: str, ip: str, status: str, latency_ms: floa
         writer.writerow([timestamp, host, ip, status, latency_str])
 
 
-def log_alert(alert: dict) -> None:
-    """Écrit une alerte dans le fichier CSV des alertes."""
+def log_alert_csv(alert: dict) -> None:
+    """Écrit une alerte dans le fichier CSV (lecture humaine)."""
     file_path = PROJECT_ROOT / ALERTS_FILE
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = file_path.exists()
@@ -93,8 +94,8 @@ def format_alert_console(alert: dict) -> str:
 
 def supervise_once(detector: AnomalyDetector) -> None:
     """
-    Lance UN cycle de supervision : ping tous les hôtes, log, et évaluation
-    par le détecteur.
+    Lance UN cycle de supervision : ping tous les hôtes, log (CSV + SQLite),
+    et évaluation par le détecteur.
     """
     timestamp = datetime.now().isoformat(timespec="seconds")
     print(f"\n[{timestamp}] Cycle de supervision...")
@@ -108,26 +109,30 @@ def supervise_once(detector: AnomalyDetector) -> None:
         else:
             print(f"  {host:12} ({ip}) → {status}")
 
-        # Log de la métrique brute
-        log_metric(timestamp, host, ip, status, latency)
+        # Persistance double : CSV (lisible) + SQLite (requêtable)
+        log_metric_csv(timestamp, host, ip, status, latency)
+        storage.insert_metric(timestamp, host, ip, status, latency)
 
         # Évaluation par le détecteur d'anomalies
         alerts = detector.evaluate(host, ip, is_alive, latency)
         for alert in alerts:
             print(format_alert_console(alert))
-            log_alert(alert)
+            log_alert_csv(alert)
+            storage.insert_alert(alert)
 
 
 def supervise_loop() -> None:
     """Boucle infinie de supervision. Ctrl+C pour arrêter."""
+    # Initialisation de la base SQLite (idempotent)
+    storage.init_db()
+
     print(f"Démarrage de la supervision (intervalle: {POLL_INTERVAL}s)")
     print(f"Hôtes supervisés: {list(HOSTS.keys())}")
-    print(f"Métriques écrites dans: {PROJECT_ROOT / METRICS_FILE}")
-    print(f"Alertes écrites dans: {PROJECT_ROOT / ALERTS_FILE}")
+    print(f"Métriques CSV  : {PROJECT_ROOT / METRICS_FILE}")
+    print(f"Alertes CSV    : {PROJECT_ROOT / ALERTS_FILE}")
+    print(f"Base SQLite    : {storage.DB_PATH}")
     print("Ctrl+C pour arrêter\n")
 
-    # Le détecteur est créé UNE SEULE FOIS, en dehors de la boucle.
-    # C'est lui qui maintient l'état entre les cycles.
     detector = AnomalyDetector()
 
     try:
@@ -139,6 +144,10 @@ def supervise_loop() -> None:
         print("\nÉtat final du détecteur :")
         for host, state in detector.get_state().items():
             print(f"  {host}: {state}")
+
+        # Affiche un mini-bilan depuis la DB
+        print("\nBilan depuis la base SQLite :")
+        print(f"  Alertes par sévérité : {storage.count_alerts_by_severity()}")
 
 
 if __name__ == "__main__":
