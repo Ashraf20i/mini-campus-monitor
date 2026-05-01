@@ -1,6 +1,7 @@
 """
 Module de supervision réseau.
-Contient les fonctions de ping et la boucle de supervision multi-hôtes.
+Contient les fonctions de ping, la boucle de supervision, et l'intégration
+avec le détecteur d'anomalies.
 """
 
 import subprocess
@@ -10,21 +11,25 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
-from src.config import HOSTS, POLL_INTERVAL, PING_TIMEOUT, METRICS_FILE
+from src.config import (
+    HOSTS,
+    POLL_INTERVAL,
+    PING_TIMEOUT,
+    METRICS_FILE,
+    ALERTS_FILE,
+)
+from src.detector import AnomalyDetector
 
+# Chemin racine du projet (calculé dynamiquement)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
 def ping_with_latency(ip: str, timeout: int = PING_TIMEOUT) -> tuple[bool, float | None]:
     """
     Ping un hôte et mesure la latence.
 
-    Args:
-        ip: adresse IP à tester
-        timeout: délai maximum en secondes
-
     Returns:
         (is_alive, latency_ms)
-        - is_alive: True si la machine répond
-        - latency_ms: latence en millisecondes, ou None si DOWN
     """
     if platform.system().lower() == "windows":
         command = ["ping", "-n", "1", "-w", str(timeout * 1000), ip]
@@ -42,31 +47,54 @@ def ping_with_latency(ip: str, timeout: int = PING_TIMEOUT) -> tuple[bool, float
 
 
 def log_metric(timestamp: str, host: str, ip: str, status: str, latency_ms: float | None) -> None:
-    """
-    Écrit une ligne de mesure dans le fichier CSV.
-
-    Crée l'en-tête si le fichier n'existe pas encore.
-    """
+    """Écrit une ligne de mesure dans le fichier CSV des métriques."""
     file_path = PROJECT_ROOT / METRICS_FILE
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = file_path.exists()
 
-    # On ouvre en mode "append" (ajouter à la fin)
     with open(file_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-
-        # Si nouveau fichier, on écrit l'en-tête
         if not file_exists:
             writer.writerow(["timestamp", "host", "ip", "status", "latency_ms"])
-
-        # Latence formatée à 2 décimales, ou vide si DOWN
         latency_str = f"{latency_ms:.2f}" if latency_ms is not None else ""
         writer.writerow([timestamp, host, ip, status, latency_str])
 
 
-def supervise_once() -> None:
+def log_alert(alert: dict) -> None:
+    """Écrit une alerte dans le fichier CSV des alertes."""
+    file_path = PROJECT_ROOT / ALERTS_FILE
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = file_path.exists()
+
+    with open(file_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "host", "ip", "type", "severity", "message"])
+        writer.writerow([
+            alert["timestamp"],
+            alert["host"],
+            alert["ip"],
+            alert["type"],
+            alert["severity"],
+            alert["message"],
+        ])
+
+
+def format_alert_console(alert: dict) -> str:
+    """Formate une alerte pour affichage dans la console."""
+    severity_icons = {
+        "CRITICAL": "🔴",
+        "WARNING": "🟡",
+        "INFO": "🟢",
+    }
+    icon = severity_icons.get(alert["severity"], "⚠")
+    return f"     {icon} [{alert['severity']}] {alert['type']}: {alert['message']}"
+
+
+def supervise_once(detector: AnomalyDetector) -> None:
     """
-    Lance UN cycle de supervision : ping tous les hôtes, log les résultats.
+    Lance UN cycle de supervision : ping tous les hôtes, log, et évaluation
+    par le détecteur.
     """
     timestamp = datetime.now().isoformat(timespec="seconds")
     print(f"\n[{timestamp}] Cycle de supervision...")
@@ -80,26 +108,38 @@ def supervise_once() -> None:
         else:
             print(f"  {host:12} ({ip}) → {status}")
 
+        # Log de la métrique brute
         log_metric(timestamp, host, ip, status, latency)
+
+        # Évaluation par le détecteur d'anomalies
+        alerts = detector.evaluate(host, ip, is_alive, latency)
+        for alert in alerts:
+            print(format_alert_console(alert))
+            log_alert(alert)
 
 
 def supervise_loop() -> None:
-    """
-    Boucle infinie de supervision. Ctrl+C pour arrêter.
-    """
+    """Boucle infinie de supervision. Ctrl+C pour arrêter."""
     print(f"Démarrage de la supervision (intervalle: {POLL_INTERVAL}s)")
     print(f"Hôtes supervisés: {list(HOSTS.keys())}")
-    print(f"Logs écrits dans: {METRICS_FILE}")
+    print(f"Métriques écrites dans: {PROJECT_ROOT / METRICS_FILE}")
+    print(f"Alertes écrites dans: {PROJECT_ROOT / ALERTS_FILE}")
     print("Ctrl+C pour arrêter\n")
+
+    # Le détecteur est créé UNE SEULE FOIS, en dehors de la boucle.
+    # C'est lui qui maintient l'état entre les cycles.
+    detector = AnomalyDetector()
 
     try:
         while True:
-            supervise_once()
+            supervise_once(detector)
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         print("\n\nSupervision arrêtée par l'utilisateur.")
+        print("\nÉtat final du détecteur :")
+        for host, state in detector.get_state().items():
+            print(f"  {host}: {state}")
 
 
-# Point d'entrée
 if __name__ == "__main__":
     supervise_loop()
