@@ -55,6 +55,10 @@ with st.sidebar:
         value=POLL_INTERVAL,
     )
 
+    if st.button("🔄 Forcer le rafraîchissement"):
+        st.cache_data.clear()
+        st.rerun()
+
 st_autorefresh(interval=refresh_seconds * 1000, key="data_refresh")
 st.caption(
     f"Supervision en temps réel — Dernière actualisation : "
@@ -64,13 +68,38 @@ st.caption(
 
 
 # ============================================================
+#  FONCTIONS DE CHARGEMENT (avec cache)
+# ============================================================
+
+@st.cache_data(ttl=2)
+def load_metrics(limit: int = 1000) -> list[dict]:
+    """
+    Charge les mesures récentes depuis SQLite.
+    Mise en cache pendant 2 secondes pour éviter les re-lectures lors
+    des interactions utilisateur (mémoïsation Streamlit).
+    """
+    return storage.get_recent_metrics(limit=limit)
+
+
+@st.cache_data(ttl=2)
+def load_alerts(limit: int = 50) -> list[dict]:
+    """Charge les alertes récentes depuis SQLite (cache 2s)."""
+    return storage.get_recent_alerts(limit=limit)
+
+
+@st.cache_data(ttl=2)
+def load_severity_counts() -> dict[str, int]:
+    """Charge le comptage des alertes par sévérité (cache 2s)."""
+    return storage.count_alerts_by_severity()
+
+
+# ============================================================
 #  CHARGEMENT DES DONNÉES
 # ============================================================
 
-# On va lire jusqu'à 1000 mesures récentes pour avoir un bon historique
-metrics = storage.get_recent_metrics(limit=1000)
-alerts = storage.get_recent_alerts(limit=50)
-severity_counts = storage.count_alerts_by_severity()
+metrics = load_metrics(limit=1000)
+alerts = load_alerts(limit=50)
+severity_counts = load_severity_counts()
 
 # Si la base est vide, on s'arrête proprement
 if not metrics:
@@ -82,8 +111,6 @@ df_metrics = pd.DataFrame(metrics)
 df_metrics["timestamp"] = pd.to_datetime(df_metrics["timestamp"])
 
 df_alerts = pd.DataFrame(alerts) if alerts else pd.DataFrame()
-
-
 # ============================================================
 #  SECTION 1 — STATUT GLOBAL (3 grandes métriques en haut)
 # ============================================================
